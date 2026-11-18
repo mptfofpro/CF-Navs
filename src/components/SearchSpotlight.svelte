@@ -1,5 +1,7 @@
+<svelte:options runes />
+
 <script lang="ts">
-  import { onDestroy, tick } from 'svelte'
+  import { onDestroy, tick, untrack } from 'svelte'
   import type { PublicBookmark, PublicCategory } from '../../shared/types'
   import {
     bookmarkMatchesSearch,
@@ -11,50 +13,73 @@
   import { isAuthenticated } from '../lib/stores'
   import { recordBookmarkClick } from '../lib/dataService'
   import SpotlightBookmarkIcon from './SpotlightBookmarkIcon.svelte'
+  import BookmarkQuickAddButton from './BookmarkQuickAddButton.svelte'
   import { isBookmarkIconAccessRequired, getPublicCategoryIds } from '../lib/adminListState'
   import { iconAccessKey } from '../lib/iconAccessKey'
+  import { getBookmarkQuickAddUrl } from '../lib/bookmarkQuickAdd'
 
-  export let open = false
-  export let bookmarks: PublicBookmark[] = []
-  export let categories: PublicCategory[] = []
-  export let onClose: (() => void) | undefined = undefined
-  export let onViewBookmark: ((bookmark: PublicBookmark) => void) | undefined = undefined
+  interface Props {
+    open?: boolean
+    bookmarks?: PublicBookmark[]
+    categories?: PublicCategory[]
+    onClose?: () => void
+    onViewBookmark?: (bookmark: PublicBookmark) => void
+    onCreateBookmark?: (url: string) => void | Promise<void>
+  }
+
+  let {
+    open = false,
+    bookmarks = [],
+    categories = [],
+    onClose = undefined,
+    onViewBookmark = undefined,
+    onCreateBookmark = undefined,
+  }: Props = $props()
 
   const RESULT_LIMIT = 50
   const MOST_VISITED_LIMIT = 8
 
-  let query = ''
-  let activeIndex = 0
-  let inputEl: HTMLInputElement | null = null
-  let dialogEl: HTMLElement | null = null
+  let query = $state('')
+  let activeIndex = $state(0)
+  let inputEl: HTMLInputElement | null = $state(null)
+  let dialogEl: HTMLElement | null = $state(null)
+  // 只在处理器 / 副作用里读写，不进模板。
   let previousActiveElement: HTMLElement | null = null
   let wasOpen = false
 
   // 索引只随 bookmarks/categories 变化重建，不随每次输入（即时过滤，不防抖：面板 ≤50 行开销极小）。
-  $: categoryTitles = new Map(categories.map((category) => [category.id, category.title]))
-  $: searchIndex = buildSearchIndex(bookmarks, categoryTitles)
-  $: normalizedQuery = normalizeSearchQuery(query)
-  $: isEmptyQuery = normalizedQuery.length === 0
-  $: matched = isEmptyQuery
+  const categoryTitles = $derived(new Map(categories.map((category) => [category.id, category.title])))
+  const searchIndex = $derived(buildSearchIndex(bookmarks, categoryTitles))
+  const normalizedQuery = $derived(normalizeSearchQuery(query))
+  const isEmptyQuery = $derived(normalizedQuery.length === 0)
+  const matched = $derived(isEmptyQuery
     ? []
-    : bookmarks.filter((bookmark) => bookmarkMatchesSearch(bookmark, normalizedQuery, searchIndex))
-  $: results = isEmptyQuery
+    : bookmarks.filter((bookmark) => bookmarkMatchesSearch(bookmark, normalizedQuery, searchIndex)))
+  const results = $derived(isEmptyQuery
     ? getMostVisitedBookmarks(bookmarks, MOST_VISITED_LIMIT)
-    : matched.slice(0, RESULT_LIMIT)
-  $: overflowCount = isEmptyQuery ? 0 : Math.max(0, matched.length - RESULT_LIMIT)
+    : matched.slice(0, RESULT_LIMIT))
+  const overflowCount = $derived(isEmptyQuery ? 0 : Math.max(0, matched.length - RESULT_LIMIT))
+  const quickAddUrl = $derived($isAuthenticated && onCreateBookmark && results.length === 0
+    ? getBookmarkQuickAddUrl(query)
+    : null)
   // 登录态下结果里可能含私密书签；只有需要授权的行才带 key（Issue #28）。
   // 与首页一致按登录态门控：登出后即使 store 里还有残留 key 也不下发。
-  $: publicCategoryIds = getPublicCategoryIds(categories)
-  $: visibleIconAccessKey = $isAuthenticated ? $iconAccessKey : ''
+  const publicCategoryIds = $derived(getPublicCategoryIds(categories))
+  const visibleIconAccessKey = $derived($isAuthenticated ? $iconAccessKey : '')
   // 结果变化后把高亮夹回有效范围，避免 aria-activedescendant 指向已消失项。
-  $: if (activeIndex >= results.length) activeIndex = 0
-
+  $effect.pre(() => {
+    if (activeIndex >= results.length) untrack(() => { activeIndex = 0 })
+  })
   // 只在 open 状态翻转时执行副作用，避免响应式重复触发。
-  $: if (open !== wasOpen) {
-    wasOpen = open
-    if (open) void handleOpened()
-    else handleClosed()
-  }
+  $effect.pre(() => {
+    const nextOpen = open
+    untrack(() => {
+      if (nextOpen === wasOpen) return
+      wasOpen = nextOpen
+      if (nextOpen) void handleOpened()
+      else handleClosed()
+    })
+  })
 
   async function handleOpened(): Promise<void> {
     previousActiveElement = (typeof document !== 'undefined' ? document.activeElement : null) as HTMLElement | null
@@ -126,7 +151,13 @@
       return
     }
 
-    if (results.length === 0) return
+    if (results.length === 0) {
+      if (quickAddUrl && event.key === 'Enter' && event.target === inputEl) {
+        event.preventDefault()
+        createBookmarkFromQuery()
+      }
+      return
+    }
 
     if (event.key === 'ArrowDown') {
       event.preventDefault()
@@ -155,6 +186,10 @@
     return categoryTitles.get(categoryId) ?? ''
   }
 
+  function createBookmarkFromQuery(): void {
+    if (quickAddUrl) void onCreateBookmark?.(quickAddUrl)
+  }
+
   // 键盘导航把高亮项滚入可视区（对齐 Sidebar/CategoryTreeSelect 的 scrollIntoView 用法）。
   // aria-activedescendant 模式下焦点始终在输入框，浏览器不会自动跟随高亮，需手动滚动。
   async function scrollActiveOptionIntoView(): Promise<void> {
@@ -168,7 +203,7 @@
 {#if open}
   <!-- scrim：点击遮罩关闭；对齐 ConfirmDialog 的居中+模糊形态 -->
   <div class="spotlight-scrim">
-    <button type="button" class="spotlight-backdrop" aria-label="关闭搜索" on:click={() => onClose?.()}></button>
+    <button type="button" class="spotlight-backdrop" aria-label="关闭搜索" onclick={() => onClose?.()}></button>
     <div
       class="spotlight-panel"
       role="dialog"
@@ -176,7 +211,7 @@
       aria-label="搜索书签"
       tabindex="-1"
       bind:this={dialogEl}
-      on:keydown={handleKeydown}
+      onkeydown={handleKeydown}
     >
       <div class="spotlight-input-row">
         <svg class="spotlight-search-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -212,8 +247,8 @@
             class:active={index === activeIndex}
             role="option"
             aria-selected={index === activeIndex}
-            on:click={() => openBookmarkFromSearch(bookmark)}
-            on:mouseenter={() => (activeIndex = index)}
+            onclick={() => openBookmarkFromSearch(bookmark)}
+            onmouseenter={() => (activeIndex = index)}
           >
             <SpotlightBookmarkIcon
               {bookmark}
@@ -226,7 +261,7 @@
             </span>
           </li>
         {/each}
-        {#if results.length === 0}
+        {#if results.length === 0 && !quickAddUrl}
           <li class="spotlight-empty" role="option" aria-selected="false" aria-disabled="true">
             {isEmptyQuery ? '输入关键词以搜索书签' : '没有匹配的书签'}
           </li>
@@ -236,8 +271,15 @@
         {/if}
       </ul>
 
+      {#if quickAddUrl}
+        <div class="spotlight-empty spotlight-quick-add">
+          <span>没有匹配的书签</span>
+          <BookmarkQuickAddButton onCreate={createBookmarkFromQuery} />
+        </div>
+      {/if}
+
       <div class="spotlight-footer">
-        <span>↑↓ 选择 · Enter 打开 · Esc 关闭</span>
+        <span>{quickAddUrl ? 'Enter 新增书签 · Esc 关闭' : '↑↓ 选择 · Enter 打开 · Esc 关闭'}</span>
       </div>
     </div>
   </div>
@@ -367,6 +409,10 @@
     cursor: pointer;
   }
 
+  .spotlight-results:empty {
+    padding: 0;
+  }
+
   .spotlight-option.active {
     background: var(--spotlight-active-bg);
     outline: 1px solid var(--spotlight-active-outline);
@@ -411,6 +457,14 @@
     text-align: center;
     color: var(--spotlight-muted);
     font-size: 11px;
+  }
+
+  .spotlight-quick-add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 12px;
   }
 
   .spotlight-footer {

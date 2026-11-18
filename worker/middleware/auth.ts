@@ -2,9 +2,10 @@ import type { MiddlewareHandler } from 'hono'
 import { ErrCode } from '../../shared/types'
 import { fail } from '../lib/response'
 import type { Env, HonoEnv, SessionValue } from '../types'
-import { getJwtSecret, verifyJwt, rotateJwtSecret } from '../lib/jwt'
+import { getJwtSecret, verifyJwt, rotateJwtSecret, refreshJwtSecretAfterVerifyFailure } from '../lib/jwt'
 import { isSessionRevoked } from '../lib/sessionRevocation'
 import { hasSessionBinding } from '../lib/sessionStore'
+import { appendServerTiming } from '../lib/serverTiming'
 
 const SESSION_MEMORY_CACHE_TTL_MS = 15_000
 const SESSION_MEMORY_CACHE_MAX = 256
@@ -59,8 +60,11 @@ export function clearAllCachedSessions(): void {
   sessionMemoryCache.clear()
 }
 
-export async function clearAllSessions(env: Env): Promise<void> {
-  await rotateJwtSecret(env.DB)
+export async function clearAllSessions(
+  env: Env,
+  alsoWrite: ReadonlyArray<readonly [key: string, value: unknown]> = [],
+): Promise<void> {
+  await rotateJwtSecret(env.DB, alsoWrite)
 }
 
 export async function validateSession(env: Env, token: string): Promise<SessionValue | null> {
@@ -74,7 +78,12 @@ export async function validateSession(env: Env, token: string): Promise<SessionV
   }
 
   const secret = await getJwtSecret(env.DB)
-  const payload = await verifyJwt(token, secret)
+  let payload = await verifyJwt(token, secret)
+  if (!payload) {
+    // 另一 isolate 刚轮换过密钥时，本 isolate 的缓存可能还是旧值：按需重读一次再校验。
+    const refreshed = await refreshJwtSecretAfterVerifyFailure(env.DB)
+    if (refreshed) payload = await verifyJwt(token, refreshed)
+  }
   if (!payload) {
     sessionMemoryCache.delete(token)
     return null
@@ -107,17 +116,26 @@ export async function validateSession(env: Env, token: string): Promise<SessionV
 }
 
 export const authRequired: MiddlewareHandler<HonoEnv> = async (c, next) => {
+  if (c.get('authenticated') === true) {
+    await next()
+    return
+  }
   const token = extractBearerToken(c.req.header('Authorization'))
   if (!token) {
     return c.json(fail(ErrCode.UNAUTHORIZED, 'unauthorized'), 401)
   }
 
+  const startedAt = performance.now()
   const session = await validateSession(c.env, token)
+  if (c.req.path === '/api/admin/data' || (c.req.method === 'GET' && /^\/api\/bookmarks\/[1-9][0-9]*$/.test(c.req.path))) {
+    appendServerTiming(c, 'auth', startedAt)
+  }
   if (!session) {
     return c.json(fail(ErrCode.UNAUTHORIZED, 'unauthorized'), 401)
   }
 
   c.set('username', session.username)
   c.set('sessionExpiresAt', session.exp)
+  c.set('authenticated', true)
   await next()
 }

@@ -167,36 +167,94 @@ async function main() {
     check('排序后 bm2 在前', list[0]?.id === bm2.id, `first=${list[0]?.id}`)
   }
 
-  // REQ-15: use only generated local data; this fixture is removed before later CRUD assertions.
-  section('REQ-15 受保护图标副本协议')
+  // 写后只确认版本的前提（代码审查三轮第 31 项）：写响应包络上的 data_version 就是随后
+  // /api/data/version 报告的版本，且写接口返回的行与 /api/admin/data 里的同一行一致。
+  section('写响应 data_version 与本地应用一致性')
   {
+    const sameRow = (a, b) => {
+      if (!a || !b) return false
+      for (const key of Object.keys(a)) {
+        if (key === 'icon_blob' || key === 'version') continue
+        if (JSON.stringify(a[key]) !== JSON.stringify(b[key])) return `${key}: ${JSON.stringify(a[key])} != ${JSON.stringify(b[key])}`
+      }
+      return true
+    }
+    const versionAfter = async (label, r) => {
+      const remote = (await call('/api/data/version', { token })).json?.data?.version
+      check(`${label} 响应带 data_version 且等于服务端版本`, typeof r.json?.data_version === 'string' && r.json.data_version === remote, `resp=${r.json?.data_version} remote=${remote}`)
+    }
+    const adminData = async () => (await call('/api/admin/data', { token })).json?.data
+    const created = await call('/api/bookmarks', { method: 'POST', token, body: { category_id: catA.id, title: '一致性', url: 'https://example.org', open_method: 1 } })
+    await versionAfter('新建书签', created)
+    const createdRow = (await adminData())?.bookmarks?.find((row) => row.id === created.json?.data?.id)
+    const createdSame = sameRow(created.json?.data, createdRow)
+    check('新建书签响应行 = 后台数据行', createdSame === true, String(createdSame))
+    const updated = await call(`/api/bookmarks/${created.json?.data?.id}`, { method: 'PUT', token, body: { category_id: catA.id, title: '一致性(改)', url: 'https://example.org', open_method: 2 } })
+    await versionAfter('更新书签', updated)
+    const updatedRow = (await adminData())?.bookmarks?.find((row) => row.id === updated.json?.data?.id)
+    const updatedSame = sameRow(updated.json?.data, updatedRow)
+    check('更新书签响应行 = 后台数据行', updatedSame === true, String(updatedSame))
+    const sorted = await call('/api/bookmarks/sort', { method: 'POST', token, body: { ids: [created.json?.data?.id, bm2.id, bm1.id] } })
+    await versionAfter('书签排序', sorted)
+    const sortedRows = (await adminData())?.bookmarks ?? []
+    const sortOf = (id) => sortedRows.find((row) => row.id === id)?.sort
+    check('书签排序后 sort = 提交下标', sortOf(created.json?.data?.id) === 0 && sortOf(bm2.id) === 1 && sortOf(bm1.id) === 2, `sorts=${sortOf(created.json?.data?.id)},${sortOf(bm2.id)},${sortOf(bm1.id)}`)
+    const cat = await call('/api/categories', { method: 'POST', token, body: { title: '一致性分类' } })
+    await versionAfter('新建分类', cat)
+    const catRow = (await adminData())?.categories?.find((row) => row.id === cat.json?.data?.id)
+    const catSame = sameRow(cat.json?.data, catRow)
+    check('新建分类响应行 = 后台数据行', catSame === true, String(catSame))
+    const catDeleted = await call(`/api/categories/${cat.json?.data?.id}`, { method: 'DELETE', token })
+    await versionAfter('删除分类', catDeleted)
+    const removed = await call(`/api/bookmarks/${created.json?.data?.id}`, { method: 'DELETE', token })
+    await versionAfter('删除书签', removed)
+    const sortedBack = await call('/api/bookmarks/sort', { method: 'POST', token, body: { ids: [bm2.id, bm1.id] } })
+    check('恢复书签排序 code=0', sortedBack.json?.code === 0)
+  }
+
+  // 图标本地优先 v2：全局 icon_epoch 只随图标相关变化递增；可信设备副本接口已移除。
+  section('图标全局标志位 icon_epoch')
+  {
+    const epochOf = async () => (await call('/api/data/version', { token })).json?.data?.icon_epoch
     const icon = 'data:image/svg+xml;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="red"/></svg>').toString('base64')
-    const created = await call('/api/bookmarks', { method: 'POST', token, body: { category_id: catA.id, title: 'Local copy fixture', url: 'https://example.com', icon, icon_source: 'custom', is_private: true } })
-    check('副本 fixture 创建成功', created.json?.code === 0 && Boolean(created.json?.data?.id))
+    const before = await epochOf()
+    check('版本接口返回整数 icon_epoch', Number.isInteger(before), String(before))
+    const created = await call('/api/bookmarks', { method: 'POST', token, body: { category_id: catA.id, title: 'Icon epoch fixture', url: 'https://example.com', icon, icon_source: 'custom', is_private: true } })
+    check('icon_epoch fixture 创建成功', created.json?.code === 0 && Boolean(created.json?.data?.id))
     const id = created.json?.data?.id
     if (id) {
       try {
-        const version = await call('/api/data/version', { token })
-        check('公开模式的版本接口提供真实会话回执', version.json?.data?.auth_receipt?.expires_at > Date.now() && /^[a-f0-9]{64}$/.test(version.json?.data?.auth_receipt?.cache_scope ?? ''))
-        const request = { protocol: 1, object_type: 'bookmark', object_id: id, dataset_epoch: version.json?.data?.dataset_epoch, expected_write_epoch: created.json?.data?.icon_write_epoch, expected_content_revision: null }
-        const anonymous = await call('/api/icon-local-copy', { method: 'POST', body: request })
-        check('副本接口匿名拒绝且不缓存', anonymous.status === 401 && anonymous.headers.get('cache-control') === 'private, no-store')
-        const copy = await call('/api/icon-local-copy', { method: 'POST', token, body: request })
-        check('副本协议返回授权成功图片及真实版本', copy.status === 200 && copy.json?.data?.persistence === 'session-scoped' && /^sha256-[a-f0-9]{64}$/.test(copy.json?.data?.descriptor?.content_revision ?? ''))
-        check('副本传输禁止浏览器与 CDN 自动缓存', copy.headers.get('cache-control') === 'private, no-store' && copy.headers.get('cdn-cache-control') === 'no-store')
-        check('副本正文与长度一致', Buffer.from(copy.json?.data?.image?.base64 ?? '', 'base64').byteLength === copy.json?.data?.image?.byte_length)
+        const afterCreate = await epochOf()
+        check('新增书签递增 icon_epoch', afterCreate > before, `${before} -> ${afterCreate}`)
         const admin = await call('/api/admin/data', { token, headers: { 'cache-control': 'no-cache' } })
+        check('后台聚合携带同一 icon_epoch', admin.json?.data?.icon_epoch === afterCreate)
         const row = admin.json?.data?.bookmarks?.find(item => item.id === id)
-        check('聚合返回轻量版本而非完整 icon_blob', row?.icon_blob === null && row?.icon_revision === copy.json?.data?.descriptor?.content_revision && admin.json?.data?.dataset_epoch === request.dataset_epoch)
-        const changed = await call('/api/bookmarks/' + id, { method: 'PUT', token, body: { category_id: catA.id, title: 'Changed local fixture', url: 'https://example.com', icon: null, is_private: true } })
+        check('聚合返回轻量版本而非完整 icon_blob', row !== undefined && row.icon_blob === null)
+        const edit = await call(`/api/bookmarks/${id}`, { token })
+        check('单条编辑返回完整原始字段', edit.json?.code === 0 && edit.json.data.id === id && edit.json.data.icon === icon && edit.json.data.is_private === 1)
+        check('单条编辑不返回缓存图片正文', edit.json?.data && !Object.hasOwn(edit.json.data, 'icon_blob'))
+        check('单条编辑禁止缓存', edit.headers.get('Cache-Control') === 'private, no-store')
+        check('单条编辑携带服务端耗时', /auth;dur=/.test(edit.headers.get('Server-Timing') || '') && /db;dur=/.test(edit.headers.get('Server-Timing') || ''))
+        check('后台聚合携带服务端耗时', /db;dur=/.test(admin.headers.get('Server-Timing') || ''))
+        const anonymousEdit = await call(`/api/bookmarks/${id}`)
+        check('单条编辑拒绝匿名访问', anonymousEdit.status === 401 && anonymousEdit.json?.code === 1001)
+        const missingEdit = await call('/api/bookmarks/2147483647', { token })
+        check('单条编辑不存在返回 1003', missingEdit.json?.code === 1003)
+        const invalidEdit = await call('/api/bookmarks/invalid', { token })
+        check('单条编辑无效编号返回 1002', invalidEdit.json?.code === 1002)
+        check('单条读取不递增 icon_epoch', await epochOf() === afterCreate)
+        await call('/api/public/bookmarks/' + id + '/click', { method: 'POST' })
+        check('点击不递增 icon_epoch', await epochOf() === afterCreate)
+        const changed = await call('/api/bookmarks/' + id, { method: 'PUT', token, body: { category_id: catA.id, title: 'Changed epoch fixture', url: 'https://example.com', icon: null, is_private: true } })
         check('清空图片成功', changed.json?.code === 0)
-        const conflict = await call('/api/icon-local-copy', { method: 'POST', token, body: request })
-        check('旧描述请求不能保存到新对象版本', conflict.status === 409 && conflict.json?.data?.reason === 'conflict' && !conflict.json?.data?.image)
-        const empty = await call('/api/icon-local-copy', { method: 'POST', token, body: { ...request, expected_write_epoch: changed.json?.data?.icon_write_epoch } })
-        check('清空与失败语义分离', empty.status === 200 && empty.json?.data?.descriptor?.state === 'empty' && empty.json?.data?.image === null)
+        check('修改图标递增 icon_epoch', await epochOf() > afterCreate)
+        const removedRoute = await call('/api/icon-local-copy', { method: 'POST', token, body: {} })
+        check('可信副本接口已移除', removedRoute.json?.code !== 0 || removedRoute.status === 404, String(removedRoute.status))
       } finally {
+        const mid = await epochOf()
         const removed = await call('/api/bookmarks/' + id, { method: 'DELETE', token })
-        check('副本 fixture 已清理', removed.json?.code === 0)
+        check('icon_epoch fixture 已清理', removed.json?.code === 0)
+        check('删除书签递增 icon_epoch', await epochOf() > mid)
       }
     }
   }
@@ -316,6 +374,51 @@ async function main() {
     check('非法 background.type 被拒绝', r.json?.code === 1002, `code=${r.json?.code}`)
   }
 
+  // 浏览器扩展逐条确认分类；旧客户端不传 category_id 时仍使用默认收件分类。
+  section('浏览器同步分类选择')
+  {
+    const enabled = await call('/api/settings', { method: 'PUT', token, body: { browser_sync_enabled: true } })
+    check('开启浏览器同步', enabled.json?.code === 0)
+    const preflight = await call('/api/categories', {
+      method: 'OPTIONS',
+      headers: { origin: 'chrome-extension://cf-navs-test', 'access-control-request-method': 'GET' },
+    })
+    check('扩展可预检分类列表', preflight.status === 204 && preflight.headers.get('access-control-allow-origin') === '*')
+    const categories = await call('/api/categories', { token, headers: { origin: 'chrome-extension://cf-navs-test' } })
+    check('分类列表鉴权响应带 CORS', categories.json?.code === 0 && categories.headers.get('access-control-allow-origin') === '*')
+
+    const selected = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: catA.id, bookmarks: [{ title: 'Selected category', url: 'https://selected.example' }] },
+    })
+    check('同步到显式选择的分类', selected.json?.code === 0 && selected.json?.data?.category_id === catA.id, JSON.stringify(selected.json))
+    const selectedRows = (await call('/api/bookmarks', { token })).json?.data || []
+    const selectedRow = selectedRows.find(item => item.url === 'https://selected.example')
+    check('书签实际写入所选分类', selectedRow?.category_id === catA.id, JSON.stringify({ catA, selectedRows }))
+
+    const missing = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: 999999, bookmarks: [{ title: 'Missing category', url: 'https://missing.example' }] },
+    })
+    check('不存在的分类返回 1003', missing.json?.code === 1003)
+    const missingRow = (await call('/api/bookmarks', { token })).json?.data?.find(item => item.url === 'https://missing.example')
+    check('无效分类不会静默写入默认分类', missingRow === undefined)
+
+    const legacy = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { bookmarks: [{ title: 'Legacy category', url: 'https://legacy.example' }] },
+    })
+    check('旧客户端仍同步到默认分类', legacy.json?.code === 0 && legacy.json?.data?.category_title === '浏览器新增收藏')
+    const invalid = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: -1, bookmarks: [{ title: 'Invalid category', url: 'https://invalid.example' }] },
+    })
+    check('非法 category_id 返回 1002', invalid.json?.code === 1002)
+    if (selectedRow?.id) await call(`/api/bookmarks/${selectedRow.id}`, { method: 'DELETE', token })
+    const legacyRow = (await call('/api/bookmarks', { token })).json?.data?.find(item => item.url === 'https://legacy.example')
+    if (legacyRow?.id) await call(`/api/bookmarks/${legacyRow.id}`, { method: 'DELETE', token })
+  }
+
   // 9. public/data（公开模式开）
   section('公开数据聚合')
   {
@@ -327,6 +430,20 @@ async function main() {
     check('public settings 不含 admin_password', d && d.settings && !('admin_password' in d.settings))
     check('public settings 不含 public_mode', d && d.settings && !('public_mode' in d.settings))
     check('public settings 含 search_engine', !!d?.settings?.search_engine)
+  }
+
+  // 9b. 公开点击计数：D1 限流（每 IP + 书签 10 分钟 3 次），与计数同 batch
+  section('点击计数限流')
+  {
+    const clickOnce = () => call(`/api/public/bookmarks/${bm1.id}/click`, { method: 'POST', headers: { 'cf-connecting-ip': '203.0.113.50' } })
+    const statuses = []
+    for (let i = 0; i < 4; i++) statuses.push((await clickOnce()).status)
+    check('点击 4 次均返回 200', statuses.every((status) => status === 200), statuses.join(','))
+    const bms = (await call('/api/bookmarks', { token })).json?.data || []
+    const clicked = bms.find((b) => b.id === bm1.id)
+    check('同一 IP + 书签只计数 3 次', clicked?.click_count === 3, `click_count=${clicked?.click_count}`)
+    const missing = await call('/api/public/bookmarks/999999/click', { method: 'POST' })
+    check('不存在的书签点击 → 404', missing.status === 404, `status=${missing.status}`)
   }
 
   // 10. 公开模式关闭 → 未登录被拒

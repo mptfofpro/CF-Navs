@@ -20,6 +20,8 @@ export {
 
 export {
   listBookmarks,
+  listBookmarksWithIconBlobs,
+  getBookmarkForEdit,
   getBookmarkIconData,
   isBookmarkIconAnonymouslyVisibleById,
   createBookmark,
@@ -48,8 +50,7 @@ export {
   getSiteConfigWithDataVersion,
   getSettingValues,
   setSettingValue,
-  getDataVersion,
-  touchDataVersion,
+  setSettingValues,
   updateSettings,
   writeSettingsPatch,
 } from './db/settings'
@@ -57,7 +58,14 @@ export {
 export { importData } from './db/import'
 
 export {
+  Mutation,
+  commitMutation,
+  createMutationReceipt,
+  type MutationReceipt,
+} from './db/mutation'
+
+export {
   BROWSER_SYNC_CATEGORY_TITLE,
-  ensureBrowserSyncCategory,
+  ensureBrowserSyncCategoryStatement,
   syncBrowserBookmarks,
 } from './db/browserSync'

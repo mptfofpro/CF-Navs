@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import type {
@@ -21,7 +22,7 @@ const { api, publicCache, adminCache, dataHooks } = vi.hoisted(() => ({
     data: { version: vi.fn() },
     public: { getData: vi.fn(), registerClick: vi.fn() },
     admin: { getData: vi.fn() },
-    bookmarks: { refreshIconCache: vi.fn() },
+    bookmarks: { refreshIconCache: vi.fn(), getForEdit: vi.fn() },
   },
   publicCache: {
     readCachedPublicDataEntry: vi.fn(),
@@ -40,7 +41,7 @@ const { api, publicCache, adminCache, dataHooks } = vi.hoisted(() => ({
   },
 }))
 
-// stores.ts 也从 api.ts 导入 getStoredAuthSession，用 importOriginal 保留真实导出，只覆盖 api。
+// stores.ts 从 api.ts 导入 authApi / 错误工具，用 importOriginal 保留真实导出，只覆盖 api。
 vi.mock('../../src/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/lib/api')>()
   return {
@@ -58,6 +59,7 @@ vi.mock('../../src/lib/adminDataCache', () => adminCache)
 vi.mock('../../src/lib/localBookmarkIconCache', () => ({
   createBookmarkIconCacheKey: () => 'key',
   writeBookmarkIconDataUri: vi.fn(),
+  fetchScheduledObjectIconPayload: vi.fn(async () => ({ blob: null, status: 'retryable' })),
 }))
 
 import {
@@ -69,22 +71,31 @@ import {
   applyLocalCategoryUpsert,
   applyPublicData,
   applyLoggedInData,
+  applyIconDescriptor,
   configureDataService,
+  persistCurrentAdminData,
   getCurrentDataVersion,
   isLoggedIn,
   refreshLoggedInData,
+  confirmLoggedInDataAfterLocalMutation,
+  recordMutationDataVersion,
   readAdminDataForEdit,
+  readBookmarkForEdit,
   recordBookmarkClick,
+  refreshBookmarkIconCacheInBackground,
   refreshPublicData,
   refreshVisibleData,
 } from '../../src/lib/dataService'
 import { adminStore, authStore, configStore, publicStore } from '../../src/lib/stores'
+import { bookmarkIconDisplay } from '../../src/lib/iconDisplayStore'
+import { createHomeDataMemo } from '../../src/lib/homeData'
 
 const settings: Settings = {
   site_title: 'CF-Navs',
   site_title_color: '#ffffff',
   site_title_font_size: 32,
   public_mode: true,
+  browser_sync_enabled: false,
   theme: 'auto',
   background_preset_id: 'custom',
   custom_accent_color: '',
@@ -116,6 +127,8 @@ const settings: Settings = {
   content_layout: { max_width: 1200, max_width_unit: 'px', margin_x: 0, margin_top: 0, margin_bottom: 0 },
   navigation: { position: 'left', always_expanded: false, top_layout: 'scroll' },
   footer_html: '',
+  most_visited_count: 8,
+  site_title_show: true,
 }
 
 const category: Category = { id: 1, parent_id: null, title: 'Tools', icon: null, sort: 0, created_at: 100 }
@@ -138,7 +151,7 @@ const bookmark: Bookmark = {
 
 function makePublicData(version?: string): PublicData {
   return {
-    categories: [{ id: category.id, title: category.title, icon: category.icon, sort: category.sort }],
+    categories: [{ id: category.id, parent_id: category.parent_id, title: category.title, icon: category.icon, sort: category.sort }],
     bookmarks: [],
     settings: toPublicSettings(settings),
     ...(version ? { version } : {}),
@@ -232,9 +245,21 @@ describe('dataService.refreshPublicData', () => {
 
     await refreshPublicData()
 
-    expect(api.public.getData).toHaveBeenCalledWith(false)
+    // The confirmed remote version keys the edge cache (`/public/data?v=new`).
+    expect(api.public.getData).toHaveBeenCalledWith(false, 'new')
     expect(publicCache.writeCachedPublicData).toHaveBeenCalledOnce()
     expect(getCurrentDataVersion()).toBe('new')
+  })
+
+  it('requests unversioned public data on a cold start without an extra version probe', async () => {
+    publicCache.readCachedPublicDataEntry.mockResolvedValue(null)
+    api.public.getData.mockResolvedValue(makePublicData('cold'))
+
+    await refreshPublicData()
+
+    expect(api.data.version).not.toHaveBeenCalled()
+    expect(api.public.getData).toHaveBeenCalledWith(false, null)
+    expect(getCurrentDataVersion()).toBe('cold')
   })
 
   it('clears admin snapshot when private-mode authenticated public fetch returns unauthorized', async () => {
@@ -270,6 +295,11 @@ describe('dataService.refreshPublicData', () => {
 })
 
 describe('dataService.recordBookmarkClick', () => {
+  beforeEach(() => {
+    // 真实 registerClick 恒返回 Promise；裸 mock 返回 undefined 会让调用点的 .catch 抛错。
+    api.public.registerClick.mockResolvedValue(null)
+  })
+
   it('persists the optimistic click into the same-version snapshot so a refresh keeps it (anonymous)', async () => {
     const seeded: PublicData = { ...makePublicData('v1'), bookmarks: [{ ...makePublicBookmark(bookmark), click_count: 0 }] }
     applyPublicData(seeded, 'v1')
@@ -292,6 +322,24 @@ describe('dataService.recordBookmarkClick', () => {
 
     expect(get(publicStore).data?.bookmarks[0].click_count).toBe(1)
     expect(api.public.getData).not.toHaveBeenCalled()
+  })
+
+  it('swallows registerClick failures instead of leaking an unhandled rejection (PR #26)', async () => {
+    applyPublicData({ ...makePublicData('v1'), bookmarks: [{ ...makePublicBookmark(bookmark), click_count: 0 }] }, 'v1')
+    api.public.registerClick.mockRejectedValueOnce(new Error('network down'))
+
+    // 行为契约：登记失败不许同步抛错、不许影响本地乐观计数。
+    expect(() => recordBookmarkClick(bookmark.id)).not.toThrow()
+    expect(api.public.registerClick).toHaveBeenCalledWith(bookmark.id)
+    expect(get(publicStore).data?.bookmarks[0].click_count).toBe(1)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // 接线断言：rejection 是否被吞只能发生在调用点接了 .catch 上。
+    // 本文件跑在 vmForks 的 jsdom 环境，vm 内的 unhandled rejection 传不到
+    // 宿主 process，行为层面测不出来，故按仓库既有的接线断言先例对源码形状兜底：
+    // 撤掉 .catch 本用例必红（已实测对照）。
+    const source = readFileSync('src/lib/dataService.ts', 'utf8')
+    expect(source).toMatch(/void api\.public\.registerClick\(bookmarkId\)\.catch\(\(\) => undefined\)/)
   })
 
   it('increments and persists the admin snapshot when logged in', () => {
@@ -355,6 +403,94 @@ describe('dataService.refreshLoggedInData', () => {
     expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
     expect(api.data.version).not.toHaveBeenCalled()
     expect(api.admin.getData).toHaveBeenCalledOnce()
+  })
+})
+
+describe('dataService.confirmLoggedInDataAfterLocalMutation', () => {
+  beforeEach(async () => {
+    authStore.setSession(null)
+    authStore.setSession(session)
+    api.admin.getData.mockResolvedValue(makeAdminData('v1'))
+    await refreshLoggedInData(true)
+    vi.clearAllMocks()
+    api.admin.getData.mockResolvedValue(makeAdminData('fresh'))
+  })
+
+  it('falls back to a full refresh when no write has reported a version', async () => {
+    await confirmLoggedInDataAfterLocalMutation()
+    expect(api.data.version).not.toHaveBeenCalled()
+    expect(api.admin.getData).toHaveBeenCalledOnce()
+    expect(getCurrentDataVersion()).toBe('fresh')
+  })
+
+  it('skips the full refetch when the server is exactly at the last reported write version', async () => {
+    recordMutationDataVersion('v2')
+    api.data.version.mockResolvedValue({ version: 'v2', site_title: 'CF-Navs', public_mode: true })
+
+    await confirmLoggedInDataAfterLocalMutation()
+
+    expect(api.data.version).toHaveBeenCalledOnce()
+    expect(api.data.version).toHaveBeenCalledWith(true)
+    expect(api.admin.getData).not.toHaveBeenCalled()
+    expect(getCurrentDataVersion()).toBe('v2')
+    expect(adminCache.writeCachedAdminData).toHaveBeenCalledOnce()
+    expect(adminCache.writeCachedAdminData.mock.calls[0]![1]).toBe('v2')
+  })
+
+  it('refetches when another writer moved the version past the last reported one', async () => {
+    recordMutationDataVersion('v2')
+    api.data.version.mockResolvedValue({ version: 'v3', site_title: 'CF-Navs', public_mode: true })
+
+    await confirmLoggedInDataAfterLocalMutation()
+
+    expect(api.admin.getData).toHaveBeenCalledOnce()
+    expect(getCurrentDataVersion()).toBe('fresh')
+  })
+
+  it('refetches when the dataset epoch changed even if the version matches', async () => {
+    recordMutationDataVersion('v2')
+    api.data.version.mockResolvedValue({ version: 'v2', dataset_epoch: 'e'.repeat(32), site_title: 'CF-Navs', public_mode: true })
+
+    await confirmLoggedInDataAfterLocalMutation()
+
+    expect(api.admin.getData).toHaveBeenCalledOnce()
+  })
+
+  it('refetches while an earlier forced full refresh has not completed', async () => {
+    let release!: (value: AdminData) => void
+    api.admin.getData.mockImplementationOnce(() => new Promise<AdminData>((resolve) => { release = resolve }))
+    const superseded = refreshLoggedInData(true)
+    await Promise.resolve()
+    recordMutationDataVersion('v2')
+    api.data.version.mockResolvedValue({ version: 'v2', site_title: 'CF-Navs', public_mode: true })
+
+    const confirming = confirmLoggedInDataAfterLocalMutation()
+    release(makeAdminData('stale'))
+    await Promise.all([superseded, confirming])
+
+    expect(api.data.version).not.toHaveBeenCalled()
+    expect(api.admin.getData).toHaveBeenCalledTimes(2)
+    expect(getCurrentDataVersion()).toBe('fresh')
+  })
+
+  it('forgets reported versions across a session change', async () => {
+    recordMutationDataVersion('v2')
+    authStore.setSession(null)
+    recordMutationDataVersion('v9')
+    authStore.setSession({ ...session, token: 'tok-2' })
+    api.data.version.mockResolvedValue({ version: 'v2', site_title: 'CF-Navs', public_mode: true })
+
+    await confirmLoggedInDataAfterLocalMutation()
+
+    expect(api.data.version).not.toHaveBeenCalled()
+    expect(api.admin.getData).toHaveBeenCalledOnce()
+  })
+
+  it('propagates a failed version probe so the caller can report it', async () => {
+    recordMutationDataVersion('v2')
+    api.data.version.mockRejectedValue(new Error('offline'))
+    await expect(confirmLoggedInDataAfterLocalMutation()).rejects.toThrow('offline')
+    expect(api.admin.getData).not.toHaveBeenCalled()
   })
 })
 
@@ -468,7 +604,7 @@ describe('dataService.refreshVisibleData', () => {
 
     await refreshVisibleData()
 
-    expect(api.public.getData).toHaveBeenCalledWith(false)
+    expect(api.public.getData).toHaveBeenCalledWith(false, null)
     expect(api.admin.getData).not.toHaveBeenCalled()
   })
 
@@ -486,7 +622,7 @@ describe('dataService.refreshVisibleData', () => {
     expect(get(authStore).session).toBeNull()
     expect(get(adminStore).data.settings).toBeNull()
     expect(adminCache.clearCachedAdminData).toHaveBeenCalledOnce()
-    expect(api.public.getData).toHaveBeenCalledWith(false)
+    expect(api.public.getData).toHaveBeenCalledWith(false, null)
   })
 
   it('drops the private home data before an unauthorized public fallback that itself fails', async () => {
@@ -669,6 +805,53 @@ describe('dataService refresh ownership', () => {
 })
 
 describe('dataService authoritative edit reads', () => {
+  it('reads only the requested bookmark without replacing projected stores or snapshots', async () => {
+    authStore.setSession(session)
+    const projected = makeAdminData('v1')
+    projected.bookmarks[0] = { ...bookmark, icon: null, icon_blob: null, icon_display: 'image' }
+    applyLoggedInData(projected)
+    const view = get(publicStore).data, admin = get(adminStore).data
+    const raw = { ...bookmark, icon: 'data:image/svg+xml;base64,PHN2Zy8+', icon_source: 'custom' }
+    api.bookmarks.getForEdit.mockResolvedValueOnce(raw)
+    const signal = new AbortController().signal
+    expect(await readBookmarkForEdit(bookmark.id, signal)).toBe(raw)
+    expect(api.bookmarks.getForEdit).toHaveBeenCalledWith(bookmark.id, signal)
+    expect(api.admin.getData).not.toHaveBeenCalled()
+    expect(get(publicStore).data).toBe(view)
+    expect(get(adminStore).data).toBe(admin)
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+    expect(adminCache.writeCachedAdminData).not.toHaveBeenCalled()
+  })
+  it('does not request a bookmark source while logged out', async () => {
+    expect(await readBookmarkForEdit(bookmark.id)).toBeNull()
+    expect(api.bookmarks.getForEdit).not.toHaveBeenCalled()
+  })
+  it('drops a single-bookmark response when the session changes', async () => {
+    authStore.setSession(session)
+    let resolve!: (data: Bookmark) => void
+    api.bookmarks.getForEdit.mockReturnValueOnce(new Promise<Bookmark>(done => { resolve = done }))
+    const pending = readBookmarkForEdit(bookmark.id)
+    authStore.setSession({ ...session, token: 'new-session' })
+    resolve(bookmark)
+    expect(await pending).toBeNull()
+  })
+  it('drops an old failed single-bookmark read without clearing a newer session', async () => {
+    authStore.setSession(session)
+    let reject!: (error: Error) => void
+    api.bookmarks.getForEdit.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail }))
+    const pending = readBookmarkForEdit(bookmark.id)
+    authStore.setSession({ ...session, token: 'new-session' })
+    reject(Object.assign(new Error('old 401'), { status: 401 }))
+    expect(await pending).toBeNull()
+    expect(get(authStore).session?.token).toBe('new-session')
+  })
+  it('does not use a projected snapshot when a single-bookmark read fails', async () => {
+    authStore.setSession(session)
+    applyLoggedInData(makeAdminData())
+    api.bookmarks.getForEdit.mockRejectedValueOnce(new Error('offline'))
+    await expect(readBookmarkForEdit(bookmark.id)).rejects.toThrow('offline')
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+  })
   it('restores source fields without replacing projected view stores or snapshots', async () => {
     authStore.setSession(session)
     const projected = makeAdminData('v1')
@@ -767,5 +950,100 @@ describe('warm public snapshot rendering', () => {
       expect(get(publicStore).data?.bookmarks.some(item=>item.id===150)).toBe(false)
       expect(getCurrentDataVersion()).toBe('replacement')
     } finally { vi.useRealTimers() }
+  })
+})
+
+describe('dataService icon descriptor state split', () => {
+  const epoch = 'a'.repeat(32)
+  const revision = 'sha256-' + 'b'.repeat(64)
+  const descriptor = (patch: Record<string, unknown> = {}) => ({
+    object_type: 'bookmark' as const, object_id: bookmark.id, dataset_epoch: epoch, write_epoch: 3, state: 'ready' as const, content_revision: revision, ...patch,
+  })
+  function loggedIn(rows: Bookmark[] = [bookmark]) {
+    authStore.setSession(session)
+    applyLoggedInData({ ...makeAdminData('v1'), bookmarks: rows, dataset_epoch: epoch } as AdminData)
+  }
+
+  it('records an icon update without replacing the bookmark arrays or Home derived data', () => {
+    loggedIn([bookmark, { ...bookmark, id: 11, sort: 1 }])
+    const admin = get(adminStore).data
+    const visible = get(publicStore).data!
+    const memo = createHomeDataMemo()
+    const sorted = memo.getSortedBookmarks(visible.bookmarks)
+    const index = memo.getSearchIndex(sorted, visible.categories, memo.getCategoryTitleMap(visible.categories))
+
+    applyIconDescriptor(descriptor())
+
+    expect(get(adminStore).data).toBe(admin)
+    expect(get(publicStore).data).toBe(visible)
+    const after = get(publicStore).data!
+    expect(memo.getSortedBookmarks(after.bookmarks)).toBe(sorted)
+    expect(memo.getSearchIndex(sorted, after.categories, memo.getCategoryTitleMap(after.categories))).toBe(index)
+    expect(bookmarkIconDisplay.get(bookmark.id)).toEqual({ dataset_epoch: epoch, icon_revision: revision, icon_write_epoch: 3, icon_display: 'image' })
+    expect(bookmarkIconDisplay.get(11)).toBeUndefined()
+  })
+
+  it('notifies only the updated bookmark id', () => {
+    loggedIn([bookmark, { ...bookmark, id: 11, sort: 1 }])
+    const seen10: unknown[] = []
+    const seen11: unknown[] = []
+    const stop10 = bookmarkIconDisplay.watch(10).subscribe((value) => seen10.push(value))
+    const stop11 = bookmarkIconDisplay.watch(11).subscribe((value) => seen11.push(value))
+    applyIconDescriptor(descriptor())
+    applyIconDescriptor(descriptor()) // 重复描述符不重复通知
+    stop10(); stop11()
+    expect(seen10).toHaveLength(2)
+    expect(seen11).toEqual([undefined])
+  })
+
+  it('keeps the previous fencing rules against the effective icon state', () => {
+    loggedIn([{ ...bookmark, icon_write_epoch: 5 }])
+    applyIconDescriptor(descriptor({ write_epoch: 4 }))
+    expect(bookmarkIconDisplay.get(bookmark.id)).toBeUndefined()
+    applyIconDescriptor(descriptor({ write_epoch: 6 }))
+    expect(bookmarkIconDisplay.get(bookmark.id)?.icon_write_epoch).toBe(6)
+    // 有效状态已是 write_epoch 6：更旧的写入不能回退它。
+    applyIconDescriptor(descriptor({ write_epoch: 5, state: 'empty', content_revision: null }))
+    expect(bookmarkIconDisplay.get(bookmark.id)?.icon_display).toBe('image')
+    // 其它数据集的描述符被忽略。
+    applyIconDescriptor(descriptor({ dataset_epoch: 'c'.repeat(32), write_epoch: 9 }))
+    expect(bookmarkIconDisplay.get(bookmark.id)?.icon_write_epoch).toBe(6)
+  })
+
+  it('persists snapshots with the icon state merged back into the rows', async () => {
+    loggedIn()
+    applyIconDescriptor(descriptor({ state: 'empty', content_revision: null }))
+    adminCache.writeCachedAdminData.mockClear()
+    await persistCurrentAdminData()
+    const written = adminCache.writeCachedAdminData.mock.calls[0][0] as AdminData
+    expect(written.bookmarks[0]).toMatchObject({ id: bookmark.id, icon_display: 'empty', icon_write_epoch: 3, icon: null, icon_blob: null, icon_cached: false })
+    expect(get(adminStore).data.bookmarks[0].icon_display).toBeUndefined()
+  })
+
+  it('drops stale icon state on newer server writes, deletions and identity changes', () => {
+    loggedIn([bookmark, { ...bookmark, id: 11, sort: 1 }])
+    applyIconDescriptor(descriptor())
+    applyIconDescriptor(descriptor({ object_id: 11 }))
+    applyLoggedInData({ ...makeAdminData('v2'), bookmarks: [{ ...bookmark, icon_write_epoch: 4 }], dataset_epoch: epoch } as AdminData)
+    expect(bookmarkIconDisplay.get(10)).toBeUndefined()
+    expect(bookmarkIconDisplay.get(11)).toBeUndefined()
+    applyIconDescriptor(descriptor({ write_epoch: 4 }))
+    expect(bookmarkIconDisplay.size).toBe(1)
+    authStore.setSession(null)
+    expect(bookmarkIconDisplay.size).toBe(0)
+  })
+})
+
+describe('dataService.refreshBookmarkIconCacheInBackground', () => {
+  it('后台补图失败不抛出，但用 console.warn 留下诊断线索', async () => {
+    const failure = new Error('network down')
+    api.bookmarks.refreshIconCache.mockRejectedValueOnce(failure)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      expect(() => refreshBookmarkIconCacheInBackground(7)).not.toThrow()
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledWith('[CF-Navs] background bookmark icon refresh failed', 7, failure))
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
